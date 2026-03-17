@@ -30,7 +30,7 @@ def process_table(src_conn, tgt_conn, table_config):
     is_batch_mode = getattr(transform_func, '__name__', '') == 'transform_nlp_batch'
 
     try:
-        with tgt_conn.cursor() as checkpoint_cur:
+        with src_conn.cursor() as checkpoint_cur:
             last_id = get_checkpoint(checkpoint_cur, name)
     except Exception as e:
         logger.error(f"[{name}] Failed to fetch initial checkpoint: {e}")
@@ -46,12 +46,12 @@ def process_table(src_conn, tgt_conn, table_config):
     # Inner helper to prevent duplicating the flush logic
     def execute_flush(high_id):
         try:
-            with tgt_conn.cursor() as tgt_cur:
+            with tgt_conn.cursor() as tgt_cur, src_conn.cursor() as checkpoint_cur:
                 if buffer:
                     flush_func(tgt_cur, buffer, name, columns)
                 if domain_buffer:
                     flush_domain_buffer(tgt_cur, domain_buffer)
-                update_checkpoint(tgt_cur, name, high_id)
+                update_checkpoint(checkpoint_cur, name, high_id)
             
                 tgt_conn.commit()
                 logger.info(f"[{name}] Successfully flushed batch. Checkpoint: {high_id}")

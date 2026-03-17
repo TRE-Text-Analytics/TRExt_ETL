@@ -18,13 +18,13 @@ def get_connections():
     return src, tgt
 
 def get_checkpoint(cursor, table_name):
-    cursor.execute("SELECT last_processed_id FROM omop.etl_checkpoint WHERE table_name = %s", (table_name,))
+    cursor.execute("SELECT last_processed_id FROM omop_temp.etl_checkpoint WHERE table_name = %s", (table_name,))
     row = cursor.fetchone()
     return row[0] if row else 0
 
 def update_checkpoint(cursor, table_name, last_id):
     cursor.execute("""
-        INSERT INTO omop.etl_checkpoint (table_name, last_processed_id) 
+        INSERT INTO omop_temp.etl_checkpoint (table_name, last_processed_id) 
         VALUES (%s, %s)
         ON CONFLICT (table_name) DO UPDATE SET last_processed_id = EXCLUDED.last_processed_id
     """, (table_name, last_id))
