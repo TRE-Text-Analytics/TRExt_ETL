@@ -15,6 +15,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ETL_Runner")
 
+# list unique combinations of columns for domain tables to prevent duplicates during inserts
+# for example, condition_occurrence should not have copies of the same person_id and condition on the same start_date.
+unique_table_col_combo = {
+    'omop.condition_occurrence': ('person_id', 'condition_concept_id', 'condition_start_date'),
+}
+
 def process_table(src_conn, tgt_conn, table_config):
     """
     A generic runner to handle streaming, transforming, and batching.
@@ -50,7 +56,18 @@ def process_table(src_conn, tgt_conn, table_config):
                 if buffer:
                     flush_func(tgt_cur, buffer, name, columns)
                 if domain_buffer:
-                    flush_domain_buffer(tgt_cur, domain_buffer)
+                    # filter duplicates based on unique_table_col_combo if applicable
+                    if name in unique_table_col_combo:
+                        seen_combos = set()
+                        filtered_domain_buffer = []
+                        for domain_table, row in domain_buffer:
+                            combo = tuple(row[i] for i in unique_table_col_combo[name])
+                            if combo not in seen_combos:
+                                seen_combos.add(combo)
+                                filtered_domain_buffer.append((domain_table, row))
+                        flush_domain_buffer(tgt_cur, filtered_domain_buffer)
+                    else:
+                        flush_domain_buffer(tgt_cur, domain_buffer)
                 update_checkpoint(checkpoint_cur, name, high_id)
             
                 tgt_conn.commit()
