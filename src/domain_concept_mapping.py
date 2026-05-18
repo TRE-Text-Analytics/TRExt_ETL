@@ -22,7 +22,7 @@ def get_max_ids(conn):
     with conn.cursor() as cur:
         for table in tables:
             cur.execute(
-                f"SELECT COALESCE(MAX({id_cols[table]}),0) FROM omop.{table}"
+                f"SELECT COALESCE(MAX({id_cols[table]}),0) FROM omop_nlp.{table}"
             )
             result[table] = cur.fetchone()[0]
 
@@ -38,12 +38,12 @@ def get_routing_map_batch(conn, snomed_codes):
         source.concept_code,
         COALESCE(target.concept_id, source.concept_id) AS standard_concept_id,
         COALESCE(target.domain_id, source.domain_id) AS domain_id
-    FROM omop.concept source
-    LEFT JOIN omop.concept_relationship cr
+    FROM omop_nlp.concept source
+    LEFT JOIN omop_nlp.concept_relationship cr
         ON source.concept_id = cr.concept_id_1
         AND cr.relationship_id = 'Maps to'
         AND cr.invalid_reason IS NULL
-    LEFT JOIN omop.concept target
+    LEFT JOIN omop_nlp.concept target
         ON cr.concept_id_2 = target.concept_id
     WHERE source.concept_code = ANY(%s)  -- Fetch all matches in one go
     AND source.vocabulary_id ILIKE 'SNOMED%%';

@@ -94,9 +94,9 @@ def transform_nlp_batch(conn, rows):
     if not rows:
         return []
 
-    # Extract all unique SNOMED codes from the batch (assuming it's at index 6)
+    # Extract all unique SNOMED codes from the batch (assuming it's at index 7, note_source_concept_id)
     # Using a set comprehension guarantees uniqueness, keeping our DB query as small as possible
-    unique_snomed_codes = {str(row[6]) for row in rows if row[6]}
+    unique_snomed_codes = {str(row[7]) for row in rows if row[7]}
 
     # Fetch the mapping for ALL codes in this batch at once
     domain_lookup_map = get_routing_map_batch(conn, unique_snomed_codes)
@@ -107,7 +107,7 @@ def transform_nlp_batch(conn, rows):
     # Iterate through the batch and apply transformations in memory
     for row in rows:
         row_list = list(row) 
-        snomed_code = str(row_list[6])
+        snomed_code = str(row_list[7])
         domain_row = None
         
         # Look up the mapping from our in-memory dictionary

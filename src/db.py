@@ -22,6 +22,15 @@ def get_checkpoint(cursor, table_name):
     row = cursor.fetchone()
     return row[0] if row else 0
 
+def create_checkpoint_table(cursor):
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS omop_temp.etl_checkpoint (
+            table_name VARCHAR(255) PRIMARY KEY,
+            last_processed_id BIGINT
+        )
+    """)
+    cursor.connection.commit()
+
 def update_checkpoint(cursor, table_name, last_id):
     cursor.execute("""
         INSERT INTO omop_temp.etl_checkpoint (table_name, last_processed_id) 
@@ -33,6 +42,7 @@ def generic_flush(cursor, data, table_name, columns=None):
     """
     A reusable flush function for any table using psycopg3's optimized executemany.
     """
+    table_name = table_name.replace("omop_temp", "omop_nlp")
     if not data:
         return
 
@@ -54,35 +64,35 @@ def flush_drug_exposure(cursor, data):
     A specialized flush function for the drug_exposure table, which may have specific constraints or indexes.
     For now, it behaves the same as generic_flush but can be optimized later if needed.
     """
-    generic_flush(cursor, data, "omop.drug_exposure", columns=["drug_exposure_id", "person_id", "drug_concept_id", "drug_exposure_start_date", "drug_exposure_end_date", "drug_type_concept_id"])
+    generic_flush(cursor, data, "omop_nlp.drug_exposure", columns=["drug_exposure_id", "person_id", "drug_concept_id", "drug_exposure_start_date", "drug_exposure_end_date", "drug_type_concept_id"])
 
 def flush_observation(cursor, data):
     """
     A specialized flush function for the observation table, which may have specific constraints or indexes.
     For now, it behaves the same as generic_flush but can be optimized later if needed.
     """
-    generic_flush(cursor, data, "omop.observation", columns=["observation_id", "person_id", "observation_concept_id", "observation_date", "observation_type_concept_id"])
+    generic_flush(cursor, data, "omop_nlp.observation", columns=["observation_id", "person_id", "observation_concept_id", "observation_date", "observation_type_concept_id"])
 
 def flush_procedure_occurrence(cursor, data):
     """
     A specialized flush function for the procedure_occurrence table, which may have specific constraints or indexes.
     For now, it behaves the same as generic_flush but can be optimized later if needed.
     """
-    generic_flush(cursor, data, "omop.procedure_occurrence", columns=["procedure_occurrence_id", "person_id", "procedure_concept_id", "procedure_date", "procedure_type_concept_id"])
+    generic_flush(cursor, data, "omop_nlp.procedure_occurrence", columns=["procedure_occurrence_id", "person_id", "procedure_concept_id", "procedure_date", "procedure_type_concept_id"])
 
 def flush_measurement(cursor, data):
     """
     A specialized flush function for the measurement table, which may have specific constraints or indexes.
     For now, it behaves the same as generic_flush but can be optimized later if needed.
     """
-    generic_flush(cursor, data, "omop.measurement", columns=["measurement_id", "person_id", "measurement_concept_id", "measurement_date", "measurement_type_concept_id"])
+    generic_flush(cursor, data, "omop_nlp.measurement", columns=["measurement_id", "person_id", "measurement_concept_id", "measurement_date", "measurement_type_concept_id"])
 
 def flush_condition_occurrence(cursor, data):
     """
     A specialized flush function for the condition_occurrence table, which may have specific constraints or indexes.
     For now, it behaves the same as generic_flush but can be optimized later if needed.
     """
-    generic_flush(cursor, data, "omop.condition_occurrence", columns=["condition_occurrence_id", "person_id", "condition_concept_id", "condition_start_date", "condition_type_concept_id"])
+    generic_flush(cursor, data, "omop_nlp.condition_occurrence", columns=["condition_occurrence_id", "person_id", "condition_concept_id", "condition_start_date", "condition_type_concept_id"])
 
 def flush_domain_buffer(cursor, domain_buffer):
     """
