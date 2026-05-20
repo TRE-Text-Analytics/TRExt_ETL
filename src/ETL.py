@@ -200,7 +200,7 @@ def run_full_etl():
                 "transform_func": transform_nlp_batch,
                 "flush_func": generic_flush,
                 "is_batch": True,  # batch processing is handled inside the transform_nlp_batch function, which takes care of fetching necessary mappings and transforming in bulk
-            }
+            },
         ]
 
         for step in steps:

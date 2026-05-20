@@ -85,7 +85,7 @@ def flush_measurement(cursor, data):
     A specialized flush function for the measurement table, which may have specific constraints or indexes.
     For now, it behaves the same as generic_flush but can be optimized later if needed.
     """
-    generic_flush(cursor, data, "omop_nlp.measurement", columns=["measurement_id", "person_id", "measurement_concept_id", "measurement_date", "measurement_type_concept_id"])
+    generic_flush(cursor, data, "omop_nlp.measurement", columns=["measurement_id", "person_id", "measurement_concept_id", "measurement_date", "measurement_type_concept_id", "value_as_number", "measurement_source_value", "unit_concept_id"])
 
 def flush_condition_occurrence(cursor, data):
     """

@@ -2,6 +2,7 @@ from domain_concept_mapping import get_max_ids, get_routing_map_batch
 from person_map import lookup_person_id
 import psycopg
 from db import TARGET_URL
+from domain_concepts.measurement import unit_types as measurement_unit_types
 
 max_ids = get_max_ids(psycopg.connect(TARGET_URL))
 last_ids = {
@@ -45,12 +46,26 @@ def get_domain_row(domain, nlp_row):
         last_ids["condition_occurrence"] += 1
     elif domain == "Measurement":
         table_name = "measurement"
+
+        value_as_number = nlp_row[13].split("|")[0].replace("value=","")
+        if value_as_number and value_as_number != "None":
+            value_as_number = float(value_as_number)
+        else:
+            value_as_number = None
+
+        measurement_source_value = str(value_as_number) if value_as_number is not None else None
+
+        unit_concept_id = measurement_unit_types.get(nlp_row[13].split("|")[1].replace("unit=","").strip(), None)
+
         new_row = (
             last_ids["measurement"] + 1,
             lookup_person_id(nlp_row[-1]), # person_id
             nlp_row[6], # standard_concept_id
             nlp_row[9], # date
-            "32423" # "NLP derived" meas concept name
+            "32423", # "NLP derived" meas concept name
+            value_as_number, # value_as_number
+            measurement_source_value, # measurement_source_value
+            unit_concept_id  # unit_concept_id
         )
         last_ids["measurement"] += 1
     elif domain == "Procedure":
