@@ -29,7 +29,9 @@ def build_mapping(mapping_path):
 
     with open(mapping_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter="\t")
-        _require_columns(reader.fieldnames, ["SOURCE_SUBJECT", "TARGET_SUBJECT"], mapping_path)
+        _require_columns(
+            reader.fieldnames, ["SOURCE_SUBJECT", "TARGET_SUBJECT"], mapping_path
+        )
 
         for row in reader:
             target = row["TARGET_SUBJECT"]
@@ -44,7 +46,10 @@ def build_mapping(mapping_path):
             mapping[target] = source
 
     if duplicates:
-        print(f"  note: {duplicates} duplicate target id(s) in the mapping.", file=sys.stderr)
+        print(
+            f"  note: {duplicates} duplicate target id(s) in the mapping.",
+            file=sys.stderr,
+        )
     return mapping
 
 
@@ -107,9 +112,19 @@ def update_person_file(person_path, mapping):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--person", default="output/person.tsv", help="Path to person.tsv (modified in place).")
-    parser.add_argument("--mapping", default="output/person_ids.tsv", help="Path to person_ids.tsv (read only).")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--person",
+        default="output/person.tsv",
+        help="Path to person.tsv (modified in place).",
+    )
+    parser.add_argument(
+        "--mapping",
+        default="output/person_ids.tsv",
+        help="Path to person_ids.tsv (read only).",
+    )
     args = parser.parse_args()
 
     for path in (args.person, args.mapping):

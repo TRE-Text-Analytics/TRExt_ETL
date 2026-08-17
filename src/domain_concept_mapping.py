@@ -1,5 +1,5 @@
-import psycopg
 from psycopg.rows import dict_row
+
 
 def get_max_ids(conn):
     tables = [
@@ -27,6 +27,7 @@ def get_max_ids(conn):
             result[table] = cur.fetchone()[0]
 
     return result
+
 
 def get_routing_map_batch(conn, snomed_codes):
     """Fetches OMOP mappings for a list of SNOMED codes in a single query."""

@@ -1,141 +1,271 @@
+"""Transform stage: map source rows into target-schema rows.
+
+Two kinds of output are produced:
+
+  * the target-table row itself (e.g. a note_nlp row trimmed to the target's
+    columns), and
+  * an optional *domain* row (condition/measurement/procedure/drug/observation)
+    derived from an NLP annotation and routed to the matching OMOP domain table.
+
+Target ids for the domain tables are allocated in-process from the current MAX in
+each table. ``initialize_last_ids`` must be called once, after connecting, before
+any transform runs — this keeps the module import-time-pure (no DB connection at
+import) and makes it testable. See the note at the bottom of this file for the
+trade-offs versus DB sequences.
+"""
+
 from domain_concept_mapping import get_max_ids, get_routing_map_batch
 from person_map import lookup_person_id
-import psycopg
-from db import TARGET_URL
+from rejects import log_reject
 from domain_concepts.measurement import unit_types as measurement_unit_types
 
-max_ids = get_max_ids(psycopg.connect(TARGET_URL))
-last_ids = {
-    "condition_occurrence": max_ids["condition_occurrence"],
-    "measurement": max_ids["measurement"],
-    "procedure_occurrence": max_ids["procedure_occurrence"],
-    "drug_exposure": max_ids["drug_exposure"],
-    "observation": max_ids["observation"],
+# OMOP "NLP derived" type-concept ids, one per domain table.
+NLP_DERIVED_TYPE = {
+    "condition_occurrence": "32424",
+    "measurement": "32423",
+    "procedure_occurrence": "32425",
+    "drug_exposure": "32426",
+    "observation": "32445",
 }
 
+VALID_DOMAINS = {"Condition", "Measurement", "Procedure", "Drug", "Observation"}
 
-def transform_note(row):
-    """
-    Input: (id, content, created_at)
-    Output: Tuple for target_notes OR None if invalid
-    """
-    row = list(row) # Convert to list for mutability
-    new_id = lookup_person_id(row[1]) # person_id is the second column in the note table
-    # map to the new person_id created by Carrot-Transform
-    row[1] = new_id
-    # Use the OMOP concept_id for 
+# Target note_nlp columns, in order. This list is the single source of truth for
+# which retrieved columns are "compatible": anything the source SELECT adds beyond
+# these (e.g. value_as_* or the joined person_id) is trimmed before insert.
+TARGET_NOTE_NLP_COLUMNS = [
+    "note_nlp_id",
+    "note_id",
+    "section_concept_id",
+    "snippet",
+    '"offset"',
+    "lexical_variant",
+    "note_nlp_concept_id",
+    "note_nlp_source_concept_id",
+    "nlp_system",
+    "nlp_date",
+    "nlp_datetime",
+    "term_exists",
+    "term_temporal",
+    "term_modifiers",
+]
+TARGET_NOTE_NLP_COL_COUNT = len(TARGET_NOTE_NLP_COLUMNS)
 
-    # ensure no unlinked notes are inserted
-    if new_id is None:
-        return None
-        
-    return tuple(row), None
+# In-process id counters, seeded by initialize_last_ids().
+last_ids = {}
+
+
+def initialize_last_ids(conn):
+    """Seed the domain id counters from the current MAX in each target table.
+
+    Call once, after connecting, before processing any rows. On a resumed run this
+    re-reads the committed MAX, so ids continue without collision or large gaps.
+    """
+    global last_ids
+    max_ids = get_max_ids(conn)
+    last_ids = {table: max_ids[table] for table in NLP_DERIVED_TYPE}
+
+
+def _next_id(table):
+    last_ids[table] += 1
+    return last_ids[table]
+
+
+def transform_note(row, columns):
+    """Map a source note row to the target note schema.
+
+    Returns ``(row, None)``, or ``(None, None)`` if the note's person can't be
+    mapped (in which case the note is logged as rejected and skipped).
+    """
+    new_person_id = lookup_person_id(row[1])
+    if new_person_id is None:
+        log_reject("omop_temp.note", row[0], "unmapped person")
+        return None, None
+
+    new_row = (
+        row[0],  # note_id
+        new_person_id,  # person_id (mapped)
+        row[2],  # note_date
+        row[3],  # note_datetime
+        row[4],  # note_type_concept_id
+        row[5],  # note_class_concept_id
+        row[6],  # note_title
+        row[7],  # note_text
+        32678,  # encoding_concept_id  -> "UTF-8"
+        4180186,  # language_concept_id  -> "English"
+        row[8],  # provider_id
+        row[9],  # visit_occurrence_id
+        row[10],  # visit_detail_id
+        row[11],  # note_source_value
+        None,  # note_event_id
+        None,  # note_event_field_concept_id
+    )
+    return new_row, None
+
+
+def _build_measurement_row(nlp_row, person_id, concept_id, date):
+    """Parse value/unit out of term_modifiers ("value=5|unit=mg") into a measurement row.
+
+    term_modifiers may be NULL, malformed, or missing the unit segment; every parse
+    failure degrades to ``None`` for that field rather than dropping the row.
+    """
+    modifiers = nlp_row[13]  # term_modifiers
+
+    try:
+        raw_value = modifiers.split("|")[0].replace("value=", "")
+        value_as_number = (
+            float(raw_value) if raw_value and raw_value != "None" else None
+        )
+    except (AttributeError, IndexError, ValueError):
+        value_as_number = None
+
+    measurement_source_value = (
+        str(value_as_number) if value_as_number is not None else None
+    )
+
+    try:
+        unit_key = modifiers.split("|")[1].replace("unit=", "").strip()
+        unit_concept_id = measurement_unit_types.get(unit_key)
+    except (AttributeError, IndexError):
+        unit_concept_id = None
+
+    row = (
+        _next_id("measurement"),
+        person_id,
+        concept_id,
+        date,
+        NLP_DERIVED_TYPE["measurement"],
+        value_as_number,
+        measurement_source_value,
+        unit_concept_id,
+    )
+    return "measurement", row
+
 
 def get_domain_row(domain, nlp_row):
-    new_row = None
-    table_name = None
-    if domain == "Condition":
-        table_name = "condition_occurrence"
-        new_row = (
-            last_ids["condition_occurrence"] + 1,
-            str(lookup_person_id(nlp_row[-1])), # person_id
-            nlp_row[6], # standard_concept_id
-            nlp_row[9], # date
-            "32424" # "NLP derived" condition concept name
-        )
-        last_ids["condition_occurrence"] += 1
-    elif domain == "Measurement":
-        table_name = "measurement"
+    """Build a domain occurrence row from a mapped note_nlp row.
 
-        value_as_number = nlp_row[13].split("|")[0].replace("value=","")
-        if value_as_number and value_as_number != "None":
-            value_as_number = float(value_as_number)
-        else:
-            value_as_number = None
-
-        measurement_source_value = str(value_as_number) if value_as_number is not None else None
-
-        unit_concept_id = measurement_unit_types.get(nlp_row[13].split("|")[1].replace("unit=","").strip(), None)
-
-        new_row = (
-            last_ids["measurement"] + 1,
-            lookup_person_id(nlp_row[-1]), # person_id
-            nlp_row[6], # standard_concept_id
-            nlp_row[9], # date
-            "32423", # "NLP derived" meas concept name
-            value_as_number, # value_as_number
-            measurement_source_value, # measurement_source_value
-            unit_concept_id  # unit_concept_id
-        )
-        last_ids["measurement"] += 1
-    elif domain == "Procedure":
-        table_name = "procedure_occurrence"
-        new_row = (
-            last_ids["procedure_occurrence"] + 1,
-            lookup_person_id(nlp_row[-1]), # person_id
-            nlp_row[6], # standard_concept_id
-            nlp_row[9], # date
-            "32425" # "NLP derived" procedure concept name
-        )
-        last_ids["procedure_occurrence"] += 1
-    elif domain == "Drug":
-        table_name = "drug_exposure"
-        new_row = (
-            last_ids["drug_exposure"] + 1,
-            lookup_person_id(nlp_row[-1]), # person_id
-            nlp_row[6], # standard_concept_id
-            nlp_row[9], # start date
-            nlp_row[9], # end date (using same as start for simplicity)
-            "32426" # "NLP derived" drug concept name
-        )
-        last_ids["drug_exposure"] += 1
-    elif domain == "Observation":
-        table_name = "observation"
-        new_row = (
-            last_ids["observation"] + 1,
-            lookup_person_id(nlp_row[-1]), # person_id
-            nlp_row[6], # standard_concept_id
-            nlp_row[9], # date
-            "32445" # "NLP derived" observation concept name
-        )
-        last_ids["observation"] += 1
-    return (table_name, new_row)
-
-def transform_nlp_batch(conn, rows):
+    Returns ``(table_name, row)``, or ``None`` to skip the row (logging why).
+    ``nlp_row[0]`` is note_nlp_id (used for traceability); ``nlp_row[-1]`` is the
+    joined note.person_id; ``nlp_row[6]`` is the standard concept id set by the
+    caller; ``nlp_row[9]`` is nlp_date.
     """
-    Input: conn (an open psycopg connection), rows (list of note_nlp.*, note.person_id tuples)
-    Output: List of (transformed_nlp_row, domain_row) tuples
+    note_nlp_id = nlp_row[0]
+    person_id = lookup_person_id(nlp_row[-1])
+    if person_id is None:
+        log_reject(
+            "omop_temp.note_nlp",
+            note_nlp_id,
+            f"unmapped person for {domain} domain row",
+        )
+        return None
+
+    concept_id = nlp_row[6]
+    date = nlp_row[9]
+
+    if domain == "Condition":
+        return "condition_occurrence", (
+            _next_id("condition_occurrence"),
+            person_id,
+            concept_id,
+            date,
+            NLP_DERIVED_TYPE["condition_occurrence"],
+        )
+
+    if domain == "Measurement":
+        return _build_measurement_row(nlp_row, person_id, concept_id, date)
+
+    if domain == "Procedure":
+        return "procedure_occurrence", (
+            _next_id("procedure_occurrence"),
+            person_id,
+            concept_id,
+            date,
+            NLP_DERIVED_TYPE["procedure_occurrence"],
+        )
+
+    if domain == "Drug":
+        return "drug_exposure", (
+            _next_id("drug_exposure"),
+            person_id,
+            concept_id,
+            date,
+            date,  # end date = start date
+            NLP_DERIVED_TYPE["drug_exposure"],
+        )
+
+    if domain == "Observation":
+        return "observation", (
+            _next_id("observation"),
+            person_id,
+            concept_id,
+            date,
+            NLP_DERIVED_TYPE["observation"],
+        )
+
+    return None
+
+
+def transform_nlp_batch(conn, rows, columns):
+    """Transform a batch of note_nlp rows, routing each to its OMOP domain table.
+
+    Returns a list of ``(note_nlp_row, domain_row_or_None)`` pairs.
     """
     if not rows:
         return []
 
-    # Extract all unique SNOMED codes from the batch (assuming it's at index 7, note_source_concept_id)
-    # Using a set comprehension guarantees uniqueness, keeping our DB query as small as possible
+    # note_nlp_source_concept_id is at index 7; None values were sentinel-cleaned.
     unique_snomed_codes = {str(row[7]) for row in rows if row[7]}
-
-    # Fetch the mapping for ALL codes in this batch at once
     domain_lookup_map = get_routing_map_batch(conn, unique_snomed_codes)
 
     results = []
-    valid_domains = {"Condition", "Measurement", "Procedure", "Drug", "Observation"}
-
-    # Iterate through the batch and apply transformations in memory
     for row in rows:
-        row_list = list(row) 
+        row_list = list(row)
+
+        # Linkage guard. note_nlp references a note (note_id) and, through it, a
+        # person. transform_note drops any note whose person can't be mapped, so a
+        # note_nlp row for that same note would be left pointing at a note that was
+        # never inserted (an orphan). The joined note.person_id is the last column,
+        # and it is the SAME source id transform_note keys on, so this fires exactly
+        # when the parent note was dropped. Skip the row entirely — no note_nlp row
+        # and no derived domain row.
+        #
+        # NB: this mirrors transform_note's drop condition. If a note is ever
+        # dropped for an additional reason (e.g. a future clean_func on the note
+        # step), that condition must be reflected here too, or orphans return.
+        if lookup_person_id(row_list[-1]) is None:
+            log_reject(
+                "omop_temp.note_nlp",
+                row_list[0],
+                "skipped: parent note dropped (unmapped person)",
+            )
+            continue
+
         snomed_code = str(row_list[7])
         domain_row = None
-        
-        # Look up the mapping from our in-memory dictionary
-        domain_lookup = domain_lookup_map.get(snomed_code)
 
-        if domain_lookup:
-            domain_id = domain_lookup["domain_id"]
-            if domain_id in valid_domains:
-                row_list[6] = domain_lookup["standard_concept_id"]
-                # Assuming get_domain_row is defined elsewhere
-                domain_row = get_domain_row(domain_id, row_list) 
-        
-        row_tuple = tuple(row_list[:-1]) # Remove the joined person_id
+        domain_lookup = domain_lookup_map.get(snomed_code)
+        if domain_lookup and domain_lookup["domain_id"] in VALID_DOMAINS:
+            row_list[6] = domain_lookup["standard_concept_id"]
+            # get_domain_row needs the full (untrimmed) row; it returns None to skip.
+            domain_row = get_domain_row(domain_lookup["domain_id"], row_list)
+
+        # Trim to the columns the target note_nlp table actually has.
+        row_tuple = tuple(row_list[:TARGET_NOTE_NLP_COL_COUNT])
         results.append((row_tuple, domain_row))
 
     return results
+
+
+def transform_nlp_relationship_batch(conn, rows, columns):
+    """Pass-through transform for note_nlp_relationship rows (no remapping needed)."""
+    if not rows:
+        return []
+    return [(tuple(row), None) for row in rows]
+
+
+def transform_nlp_relationship_part_batch(conn, rows, columns):
+    """Pass-through transform for note_nlp_relationship_part rows (no remapping needed)."""
+    if not rows:
+        return []
+    return [(tuple(row), None) for row in rows]

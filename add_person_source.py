@@ -35,33 +35,51 @@ except ImportError:
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Update person.person_source_value from a CSV file."
     )
 
-    parser.add_argument("--csv", required=True, metavar="FILE",
-                        help="Path to the input CSV file.")
+    parser.add_argument(
+        "--csv", required=True, metavar="FILE", help="Path to the input CSV file."
+    )
 
-    parser.add_argument("--has-header", action="store_true", default=False,
-                        help="Pass this flag if the CSV has a header row to skip.")
+    parser.add_argument(
+        "--has-header",
+        action="store_true",
+        default=False,
+        help="Pass this flag if the CSV has a header row to skip.",
+    )
 
     # Connection — either a DSN or individual params
     conn_group = parser.add_mutually_exclusive_group(required=True)
-    conn_group.add_argument("--dsn", metavar="DSN",
-                            help="Full PostgreSQL DSN, e.g. postgresql://user:pass@host/db")
-    conn_group.add_argument("--host", metavar="HOST",
-                            help="Database host (use with --dbname, --user, etc.)")
+    conn_group.add_argument(
+        "--dsn",
+        metavar="DSN",
+        help="Full PostgreSQL DSN, e.g. postgresql://user:pass@host/db",
+    )
+    conn_group.add_argument(
+        "--host", metavar="HOST", help="Database host (use with --dbname, --user, etc.)"
+    )
 
-    parser.add_argument("--port",     default=5432,  type=int, metavar="PORT")
-    parser.add_argument("--dbname",   metavar="DBNAME")
-    parser.add_argument("--user",     metavar="USER")
+    parser.add_argument("--port", default=5432, type=int, metavar="PORT")
+    parser.add_argument("--dbname", metavar="DBNAME")
+    parser.add_argument("--user", metavar="USER")
     parser.add_argument("--password", metavar="PASSWORD", default="")
-    parser.add_argument("--schema",   metavar="SCHEMA", default="public",
-                        help="Schema that contains the person table (default: public).")
+    parser.add_argument(
+        "--schema",
+        metavar="SCHEMA",
+        default="public",
+        help="Schema that contains the person table (default: public).",
+    )
 
-    parser.add_argument("--dry-run", action="store_true", default=False,
-                        help="Parse the CSV and print updates without touching the database.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Parse the CSV and print updates without touching the database.",
+    )
 
     return parser.parse_args()
 
@@ -69,6 +87,7 @@ def parse_args():
 # ---------------------------------------------------------------------------
 # CSV loading
 # ---------------------------------------------------------------------------
+
 
 def load_csv(path: str, has_header: bool) -> list[tuple[str, str]]:
     """
@@ -92,11 +111,13 @@ def load_csv(path: str, has_header: bool) -> list[tuple[str, str]]:
                 continue  # skip blank lines
 
             if len(row) < 2:
-                print(f"  WARNING: line {line_no} has fewer than 2 columns — skipped: {row}")
+                print(
+                    f"  WARNING: line {line_no} has fewer than 2 columns — skipped: {row}"
+                )
                 continue
 
             source_value = row[0].strip()
-            target_id    = row[1].strip()
+            target_id = row[1].strip()
 
             if not source_value or not target_id:
                 print(f"  WARNING: line {line_no} has empty values — skipped: {row}")
@@ -110,6 +131,7 @@ def load_csv(path: str, has_header: bool) -> list[tuple[str, str]]:
 # ---------------------------------------------------------------------------
 # Database update
 # ---------------------------------------------------------------------------
+
 
 def build_connection(args) -> "psycopg2.connection":
     if args.dsn:
@@ -139,12 +161,14 @@ def run_updates(conn, rows: list[tuple[str, str]], schema: str) -> None:
     updated = 0
     not_found = 0
 
-    with conn:                          # transaction
+    with conn:  # transaction
         with conn.cursor() as cur:
             for source_value, target_id in rows:
                 cur.execute(sql, (source_value, target_id))
                 if cur.rowcount == 0:
-                    print(f"  WARNING: person_id={target_id!r} not found — no row updated.")
+                    print(
+                        f"  WARNING: person_id={target_id!r} not found — no row updated."
+                    )
                     not_found += 1
                 else:
                     updated += cur.rowcount
@@ -155,6 +179,7 @@ def run_updates(conn, rows: list[tuple[str, str]], schema: str) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main():
     args = parse_args()
@@ -175,7 +200,7 @@ def main():
             print(f"{source_value:<30} {target_id}")
         return
 
-    print(f"\nConnecting to database …")
+    print("\nConnecting to database …")
     try:
         conn = build_connection(args)
     except psycopg2.OperationalError as exc:

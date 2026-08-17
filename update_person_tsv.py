@@ -2,6 +2,7 @@ import pandas as pd
 import sys
 import os
 
+
 def update_ethnicity_concept_id(input_file, output_file=None):
     # Generate output filename if not provided
     if output_file is None:
@@ -9,22 +10,23 @@ def update_ethnicity_concept_id(input_file, output_file=None):
         output_file = f"{base}_updated{ext}"
 
     # Read the TSV file
-    df = pd.read_csv(input_file, sep='\t')
+    df = pd.read_csv(input_file, sep="\t")
 
-    if 'ethnicity_concept_id' not in df.columns:
-        print(f"Error: Column 'ethnicity_concept_id' not found.")
+    if "ethnicity_concept_id" not in df.columns:
+        print("Error: Column 'ethnicity_concept_id' not found.")
         print(f"Available columns: {list(df.columns)}")
         sys.exit(1)
 
     # Update the column
-    original_count = df['ethnicity_concept_id'].nunique()
-    df['ethnicity_concept_id'] = 759814
+    original_count = df["ethnicity_concept_id"].nunique()
+    df["ethnicity_concept_id"] = 759814
 
     # Save to new file
-    df.to_csv(output_file, sep='\t', index=False)
+    df.to_csv(output_file, sep="\t", index=False)
 
     print(f"Done! Updated {len(df)} rows (was {original_count} unique value(s)).")
     print(f"Saved to: {output_file}")
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:

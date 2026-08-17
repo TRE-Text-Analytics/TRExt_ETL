@@ -1,117 +1,137 @@
+"""ETL runner.
+
+Streams each configured source table through a uniform pipeline:
+
+    retrieve  ->  clean  ->  transform  ->  insert
+
+Cleaning and transformation are pluggable per step. Data and its checkpoint are
+written to the target in a single transaction per flush, so a run resumes exactly
+where the last committed batch ended.
+"""
+
+import logging
+import sys
+
 from db import (
     BATCH_SIZE,
     FETCH_SIZE,
+    create_checkpoint_table,
     flush_domain_buffer,
     generic_flush,
     get_checkpoint,
     get_connections,
     update_checkpoint,
-    create_checkpoint_table,
 )
-from transform import transform_note, transform_nlp_batch
-import logging
-import sys
-
-log_filename = "etl_errors.log"
+from transform import (
+    initialize_last_ids,
+    transform_note,
+    transform_nlp_batch,
+    transform_nlp_relationship_batch,
+    transform_nlp_relationship_part_batch,
+)
+from clean import clean_note_nlp_row
+from rejects import log_reject
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler(log_filename),  # Logs to a file
-        logging.StreamHandler(
-            sys.stdout
-        ),  # Also still outputs to console for visibility
+        logging.FileHandler("etl_errors.log"),
+        logging.StreamHandler(sys.stdout),
     ],
 )
 logger = logging.getLogger("ETL_Runner")
 
-# list unique combinations of columns for domain tables to prevent duplicates during inserts
-# for example, condition_occurrence should not have copies of the same person_id and condition on the same start_date.
-unique_table_col_combo = {
-    "omop_nlp.condition_occurrence": (
-        "person_id",
-        "condition_concept_id",
-        "condition_start_date",
-    ),
-}
-
 
 def process_table(src_conn, tgt_conn, table_config):
-    """
-    A generic runner to handle streaming, transforming, and batching.
-    Supports both row-by-row and batch transformation functions.
+    """Stream one source table through clean -> transform -> flush.
+
+    Supports both row-by-row transforms (``transform_func(row, columns)``) and
+    batch transforms (``transform_func(conn, rows, columns)``), selected by the
+    step's ``is_batch`` flag.
+
+    Returns True if the step completed, False if it aborted (bad DDL, checkpoint
+    failure, or a mid-run error). The caller uses this to stop the chain: a
+    downstream step must not run after an upstream one aborted, or it would load
+    rows referencing parents the failed step never inserted.
     """
     name = table_config["name"]
     query = table_config["query"]
+    clean_func = table_config.get("clean_func")  # optional row cleaner
     transform_func = table_config["transform_func"]
     flush_func = table_config["flush_func"]
-    columns = table_config.get("columns")  # Optional
+    # Target-table columns for the INSERT — kept separate from the SELECT columns,
+    # since some steps retrieve extra columns (e.g. a joined person_id) that are
+    # dropped before insert.
+    insert_columns = table_config.get("insert_columns")
+    is_batch_mode = table_config.get("is_batch", False)
 
-    # Determine if we are using the batch processing function
-    is_batch_mode = getattr(transform_func, "__name__", "") == "transform_nlp_batch"
+    # Optional per-step target DDL.
+    table_creation_sql = table_config.get("create_table")
+    if table_creation_sql:
+        try:
+            with tgt_conn.cursor() as tgt_cur:
+                tgt_cur.execute(table_creation_sql)
+                tgt_conn.commit()
+                logger.info(f"[{name}] Table creation/check completed.")
+        except Exception as e:
+            logger.error(f"[{name}] Failed to create/check table: {e}")
+            return False
 
+    # Read the checkpoint from the target; create the checkpoint table if absent.
     try:
-        with src_conn.cursor() as checkpoint_cur:
+        with tgt_conn.cursor() as checkpoint_cur:
             last_id = get_checkpoint(checkpoint_cur, name)
     except Exception as e:
         logger.error(
-            f"[{name}] Failed to fetch initial checkpoint, attempting to create checkpoint table: {e}"
+            f"[{name}] Failed to fetch checkpoint, attempting to create table: {e}"
         )
         try:
-            src_conn.rollback()  # Ensure we clear any failed transaction before trying to create the checkpoint table
-            with src_conn.cursor() as checkpoint_cur:
+            tgt_conn.rollback()
+            with tgt_conn.cursor() as checkpoint_cur:
                 create_checkpoint_table(checkpoint_cur)
                 last_id = get_checkpoint(checkpoint_cur, name)
         except Exception as e2:
             logger.error(f"[{name}] Failed to create checkpoint table: {e2}")
-            return
+            return False
 
-    print(f"--- Starting {name} from ID {last_id} ---")
+    logger.info(f"--- Starting {name} from ID {last_id} ---")
 
-    raw_buffer = []  # Holds untransformed rows (only used in batch mode)
-    buffer = []  # Contains transformed rows ready for bulk insert
-    domain_buffer = []  # Tuple of (domain_table_name, row) for domain-specific inserts
+    raw_buffer = []  # cleaned-but-untransformed rows (batch mode only)
+    buffer = []  # transformed target rows ready to insert
+    domain_buffer = []  # (domain_table_name, row) pairs for domain inserts
     current_high_id = last_id
+    retrieval_columns = None
+    rejected_count = 0
 
-    # Inner helper to prevent duplicating the flush logic
     def execute_flush(high_id):
+        """Insert buffered rows and advance the checkpoint atomically on the target."""
         try:
-            with tgt_conn.cursor() as tgt_cur, src_conn.cursor() as checkpoint_cur:
+            with tgt_conn.cursor() as tgt_cur:
                 if buffer:
-                    flush_func(tgt_cur, buffer, name, columns)
+                    flush_func(tgt_cur, buffer, name, insert_columns)
                 if domain_buffer:
-                    # filter duplicates based on unique_table_col_combo if applicable
-                    if name in unique_table_col_combo:
-                        seen_combos = set()
-                        filtered_domain_buffer = []
-                        for domain_table, row in domain_buffer:
-                            combo = tuple(row[i] for i in unique_table_col_combo[name])
-                            if combo not in seen_combos:
-                                seen_combos.add(combo)
-                                filtered_domain_buffer.append((domain_table, row))
-                        flush_domain_buffer(tgt_cur, filtered_domain_buffer)
-                    else:
-                        flush_domain_buffer(tgt_cur, domain_buffer)
-                update_checkpoint(checkpoint_cur, name, high_id)
-
-                tgt_conn.commit()
-                logger.info(
-                    f"[{name}] Successfully flushed batch. Checkpoint: {high_id}"
-                )
-
+                    flush_domain_buffer(tgt_cur, domain_buffer)
+                update_checkpoint(tgt_cur, name, high_id)
+            tgt_conn.commit()
+            logger.info(f"[{name}] Flushed batch. Checkpoint: {high_id}")
         except Exception as e:
-            # IMPORTANT: Rollback the transaction on ANY failure
             tgt_conn.rollback()
             logger.error(
-                f"[{name}] Critical error during flush at ID {high_id}. Transaction rolled back."
+                f"[{name}] Flush failed at ID {high_id}; transaction rolled back."
             )
             logger.error(f"Error details: {e}")
-            # Raise the error to stop the whole ETL process rather than continuing with bad state
             raise
         finally:
             buffer.clear()
             domain_buffer.clear()
+
+    def absorb(batch_results):
+        for transformed, domain_row in batch_results:
+            if transformed:
+                buffer.append(transformed)
+            if domain_row:
+                domain_buffer.append(domain_row)
 
     try:
         with src_conn.cursor(name=f"{name}_cursor") as src_cur:
@@ -119,93 +139,206 @@ def process_table(src_conn, tgt_conn, table_config):
             src_cur.execute(query, (last_id,))
 
             for row in src_cur:
-                current_high_id = row[
-                    0
-                ]  # Assumes ID used for checkpointing is the first col
+                if retrieval_columns is None:
+                    retrieval_columns = [desc[0] for desc in src_cur.description]
+
+                current_high_id = row[0]  # checkpoint id, taken from the RAW row
+
+                if clean_func:
+                    cleaned, reason = clean_func(row, retrieval_columns)
+                    if cleaned is None:
+                        rejected_count += 1
+                        log_reject(name, current_high_id, reason)
+                        continue  # skip transform + insert; checkpoint still advances
+                    row = cleaned
+
                 try:
                     if is_batch_mode:
                         raw_buffer.append(row)
-                        # If we hit the batch size, transform the whole chunk at once
                         if len(raw_buffer) >= BATCH_SIZE:
-                            # Pass the target connection and the raw rows to our batch function
-                            batch_results = transform_func(tgt_conn, raw_buffer)
-
-                            # Unpack the results into the respective insert buffers
-                            for transformed, domain_row in batch_results:
-                                if transformed:
-                                    buffer.append(transformed)
-                                if domain_row:
-                                    domain_buffer.append(domain_row)
-
+                            absorb(
+                                transform_func(tgt_conn, raw_buffer, retrieval_columns)
+                            )
                             execute_flush(current_high_id)
                             raw_buffer.clear()
                     else:
-                        # Standard row-by-row processing
-                        transformed, domain_row = transform_func(row)
+                        transformed, domain_row = transform_func(row, retrieval_columns)
                         if transformed:
                             buffer.append(transformed)
                         if domain_row:
                             domain_buffer.append(domain_row)
-
                         if len(buffer) >= BATCH_SIZE:
                             execute_flush(current_high_id)
-
                 except Exception as trans_err:
                     logger.error(
                         f"[{name}] Transformation error at row {current_high_id}: {trans_err}"
                     )
                     raise
 
-        # Final wrap up for any remaining rows
+        # Flush any tail rows.
         if is_batch_mode and raw_buffer:
-            batch_results = transform_func(tgt_conn, raw_buffer)
-            for transformed, domain_row in batch_results:
-                if transformed:
-                    buffer.append(transformed)
-                if domain_row:
-                    domain_buffer.append(domain_row)
+            absorb(transform_func(tgt_conn, raw_buffer, retrieval_columns))
 
         if buffer or domain_buffer:
             execute_flush(current_high_id)
 
+        if rejected_count:
+            logger.warning(
+                f"[{name}] Rejected {rejected_count} source row(s); see "
+                f"etl_rejected_rows.log."
+            )
+
+        return True
+
     except Exception as main_err:
         logger.critical(f"[{name}] ETL process halted: {main_err}")
-        # Ensure any hanging transactions are cleared
         tgt_conn.rollback()
+        return False
+
+
+def build_steps():
+    """Return the ordered list of ETL step configs."""
+    return [
+        {
+            "name": "omop_temp.note",
+            "query": "SELECT note_id, person_id, note_date, note_datetime, "
+            "note_type_concept_id, note_class_concept_id, note_title, note_text, "
+            "provider_id, visit_occurrence_id, visit_detail_id, note_source_value "
+            "FROM omop_temp.note "
+            "WHERE note_id > %s "
+            "ORDER BY note_id ASC",
+            "transform_func": transform_note,
+            "flush_func": generic_flush,
+            "is_batch": False,
+        },
+        {
+            "name": "omop_temp.note_nlp",
+            "query": """SELECT
+                        note_nlp.note_nlp_id,
+                        note_nlp.note_id,
+                        note_nlp.section_concept_id,
+                        note_nlp.snippet,
+                        note_nlp."offset",
+                        note_nlp.lexical_variant,
+                        note_nlp.note_nlp_concept_id,
+                        note_nlp.note_nlp_source_concept_id,
+                        note_nlp.nlp_system,
+                        note_nlp.nlp_date,
+                        note_nlp.nlp_datetime,
+                        note_nlp.term_exists,
+                        note_nlp.term_temporal,
+                        note_nlp.term_modifiers,
+                        note_nlp.value_as_number,
+                        note_nlp.value_as_string,
+                        note_nlp.value_as_date,
+                        note_nlp.value_as_boolean,
+                        note_nlp.value_as_concept,
+                        note.person_id
+                    FROM omop_temp.note_nlp AS note_nlp
+                    INNER JOIN omop_temp.note AS note ON note_nlp.note_id = note.note_id
+                    WHERE note_nlp_id > %s
+                    ORDER BY note_nlp_id ASC""",
+            "transform_func": transform_nlp_batch,
+            "flush_func": generic_flush,
+            "clean_func": clean_note_nlp_row,
+            "insert_columns": [
+                "note_nlp_id",
+                "note_id",
+                "section_concept_id",
+                "snippet",
+                '"offset"',
+                "lexical_variant",
+                "note_nlp_concept_id",
+                "note_nlp_source_concept_id",
+                "nlp_system",
+                "nlp_date",
+                "nlp_datetime",
+                "term_exists",
+                "term_temporal",
+                "term_modifiers",
+            ],
+            "is_batch": True,
+        },
+        {
+            "name": "omop_temp.note_nlp_relationship",
+            "query": "SELECT nnr.relationship_id, nnr.relationship_concept_id, "
+            "nnr.relationship_source_value, nnr.nlp_system "
+            "FROM omop_temp.note_nlp_relationship AS nnr "
+            "WHERE nnr.relationship_id > %s "
+            "ORDER BY nnr.relationship_id ASC",
+            "transform_func": transform_nlp_relationship_batch,
+            "flush_func": generic_flush,
+            "insert_columns": [
+                "relationship_id",
+                "relationship_concept_id",
+                "relationship_source_value",
+                "nlp_system",
+            ],
+            "is_batch": True,
+            "create_table": """
+                CREATE TABLE IF NOT EXISTS omop_nlp.note_nlp_relationship
+                (
+                    relationship_id bigint NOT NULL GENERATED BY DEFAULT AS IDENTITY,
+                    relationship_concept_id integer NOT NULL,
+                    relationship_source_value character varying(100) NOT NULL,
+                    nlp_system character varying(250) NOT NULL,
+                    CONSTRAINT xpk_note_nlp_relationship PRIMARY KEY (relationship_id)
+                )
+                """,
+        },
+        {
+            "name": "omop_temp.note_nlp_relationship_part",
+            "query": "SELECT nnrp.relationship_part_id, nnrp.relationship_id, "
+            "nnrp.note_nlp_id, nnrp.role_concept_id, nnrp.role_source_value "
+            "FROM omop_temp.note_nlp_relationship_part AS nnrp "
+            "WHERE nnrp.relationship_part_id > %s "
+            "ORDER BY nnrp.relationship_part_id ASC",
+            "transform_func": transform_nlp_relationship_part_batch,
+            "flush_func": generic_flush,
+            "insert_columns": [
+                "relationship_part_id",
+                "relationship_id",
+                "note_nlp_id",
+                "role_concept_id",
+                "role_source_value",
+            ],
+            "is_batch": True,
+            "create_table": """
+                CREATE TABLE IF NOT EXISTS omop_nlp.note_nlp_relationship_part
+                (
+                    relationship_part_id bigint NOT NULL GENERATED BY DEFAULT AS IDENTITY,
+                    relationship_id bigint NOT NULL,
+                    note_nlp_id bigint NOT NULL,
+                    role_concept_id integer NOT NULL,
+                    role_source_value character varying(100) NOT NULL,
+                    CONSTRAINT xpk_note_nlp_relationship_part PRIMARY KEY (relationship_part_id),
+                    CONSTRAINT xfk_part_to_note_nlp FOREIGN KEY (note_nlp_id)
+                        REFERENCES omop_nlp.note_nlp (note_nlp_id) ON DELETE CASCADE,
+                    CONSTRAINT xfk_part_to_relationship FOREIGN KEY (relationship_id)
+                        REFERENCES omop_nlp.note_nlp_relationship (relationship_id) ON DELETE CASCADE
+                )
+            """,
+        },
+    ]
 
 
 def run_full_etl():
     src_conn, tgt_conn = get_connections()
-
     try:
-        # Define the ETL steps
-        steps = [
-            {
-                "name": "omop_temp.note",
-                "query": "SELECT * "
-                "FROM omop_temp.note "
-                "WHERE note_id > %s "
-                "ORDER BY note_id ASC",
-                "transform_func": transform_note,
-                "flush_func": generic_flush,
-                "is_batch": False,
-            },
-            {
-                "name": "omop_temp.note_nlp",
-                "query": "SELECT note_nlp.*, note.person_id "
-                "FROM omop_temp.note_nlp AS note_nlp "
-                "INNER JOIN omop_temp.note AS note ON note_nlp.note_id = note.note_id "
-                "WHERE note_nlp_id > %s "
-                "ORDER BY note_nlp_id ASC",
-                "transform_func": transform_nlp_batch,
-                "flush_func": generic_flush,
-                "is_batch": True,  # batch processing is handled inside the transform_nlp_batch function, which takes care of fetching necessary mappings and transforming in bulk
-            },
-        ]
+        # Seed domain id counters from the target's current MAX before transforming.
+        initialize_last_ids(tgt_conn)
 
-        for step in steps:
-            process_table(src_conn, tgt_conn, step)
-
+        # Steps are ordered by dependency (note -> note_nlp -> relationship ...).
+        # If a step aborts, stop: running a downstream step against parents the
+        # failed step never inserted would create exactly the orphans we exclude.
+        for step in build_steps():
+            completed = process_table(src_conn, tgt_conn, step)
+            if not completed:
+                logger.critical(
+                    f"Step '{step['name']}' did not complete; skipping remaining "
+                    f"steps to avoid orphaned downstream records."
+                )
+                break
     finally:
         src_conn.close()
         tgt_conn.close()
